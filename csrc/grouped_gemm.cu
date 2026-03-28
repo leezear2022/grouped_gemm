@@ -3,12 +3,12 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/detail/KernelUtils.h>
-#include <c10/util/BFloat16.h>
+#include <c10/util/Float8_e4m3fn.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cub/cub.cuh>
 #include <torch/extension.h>
 
-#include "cutlass/bfloat16.h"
+#include "cutlass/float8.h"
 #include "cutlass/complex.h"
 #include "cutlass/gemm/kernel/gemm_grouped.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
@@ -434,6 +434,35 @@ void CublasGroupedGemmVariableK(torch::Tensor a,
   }
 }
 
+void AtenScaledGroupedGemmFP8(torch::Tensor a,
+                              torch::Tensor b,
+                              torch::Tensor c,
+                              torch::Tensor batch_sizes,
+                              bool trans_b) {
+  int64_t bs = batch_sizes.size(0);
+  auto scale_a = at::scalar_tensor(1.0f, torch::TensorOptions().dtype(torch::kFloat32).device(a.device()));
+  auto scale_b = at::scalar_tensor(1.0f, torch::TensorOptions().dtype(torch::kFloat32).device(a.device()));
+  
+  int64_t a_offset = 0;
+  for (int i = 0; i < bs; ++i) {
+    int64_t m = batch_sizes.data_ptr<int64_t>()[i];
+    if (m == 0) continue;
+    
+    auto a_slice = a.narrow(0, a_offset, m);
+    auto b_slice = b.select(0, i);
+    auto c_slice = c.narrow(0, a_offset, m);
+    
+    if (trans_b) {
+        b_slice = b_slice.t();
+    } else {
+        b_slice = b_slice.t().contiguous().t();
+    }
+    
+    at::_scaled_mm_out(c_slice, a_slice, b_slice, scale_a, scale_b, {}, {}, c.scalar_type(), false);
+    a_offset += m;
+  }
+}
+
 void GroupedGemmVariableK(torch::Tensor a,
 			  torch::Tensor b,
 			  torch::Tensor c,
@@ -442,7 +471,7 @@ void GroupedGemmVariableK(torch::Tensor a,
   // (tokens, hidden_out) for 'b'.
   TORCH_CHECK(b.is_cuda());
   TORCH_CHECK(b.ndimension() == 2);
-  TORCH_CHECK(b.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(b.scalar_type() == torch::kFloat8_e4m3fn);
 
   // Validate the dimensions.
   int64_t tokens = a.size(0), num_experts = batch_sizes.size(0);
@@ -454,7 +483,7 @@ void GroupedGemmVariableK(torch::Tensor a,
   // Validate the output shape.
   TORCH_CHECK(c.is_cuda());
   TORCH_CHECK(c.ndimension() == 3);
-  TORCH_CHECK(c.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(c.scalar_type() == torch::kFloat8_e4m3fn);
   TORCH_CHECK(c.size(0) == num_experts);
   TORCH_CHECK(c.size(1) == m);
   TORCH_CHECK(c.size(2) == n);
@@ -489,7 +518,7 @@ void GroupedGemm(torch::Tensor a,
   // (tokens, hidden_in) for 'a'.
   TORCH_CHECK(a.is_cuda());
   TORCH_CHECK(a.ndimension() == 2);
-  TORCH_CHECK(a.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn);
 
 #if !defined(GROUPED_GEMM_CUTLASS)
   if (trans_a) {
@@ -502,8 +531,8 @@ void GroupedGemm(torch::Tensor a,
 
   TORCH_CHECK(b.is_cuda());
   TORCH_CHECK(c.is_cuda());
-  TORCH_CHECK(b.scalar_type() == torch::kBFloat16);
-  TORCH_CHECK(c.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(b.scalar_type() == torch::kFloat8_e4m3fn);
+  TORCH_CHECK(c.scalar_type() == torch::kFloat8_e4m3fn);
 
   // The expected shapes of 'b' and 'c' are:
   //   * when 'trans_a' is set: b=(tokens, hidden_out),                 c=(num_experts, hidden_in, hidden_out)

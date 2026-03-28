@@ -2,7 +2,7 @@
 
 #include <ATen/cuda/detail/KernelUtils.h>
 #include <cub/cub.cuh>
-#include <cutlass/bfloat16.h>
+#include <cutlass/float8.h>
 #include <cutlass/gemm_coord.h>
 
 namespace grouped_gemm {
